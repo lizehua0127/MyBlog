@@ -14,6 +14,7 @@ keywords: "android,python,vue,小程序,前端,js,jquery,javascript,html5,开发
 ## If your site is put in a subdirectory, set url as 'http://yoursite.com/child' and root as '/child/'
 url: //litten.me
 root: /
+#root: /blog
 permalink: :year/:month/:day/:title/
 tag_dir: tags
 archive_dir: archives
@@ -98,6 +99,7 @@ exclude_generator:
 deploy:
   type: git
   repository: git@github.com:lizehua0127/lizehua0127.github.io.git
+#  repository: git@gitee.com:galiton/galiton.git
   branch: master
 
 sitemap:
