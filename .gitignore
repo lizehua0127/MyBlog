@@ -12,6 +12,7 @@ selenium-debug.log
 .idea
 .vscode
 .deploy_git
+.package-lock.json
 public/
 *.suo
 *.ntvs*
