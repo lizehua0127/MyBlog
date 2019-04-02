@@ -11,7 +11,10 @@ selenium-debug.log
 # Editor directories and files
 .idea
 .vscode
+.deploy_git
+public/
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
+Would skip repository .deploy_git/
