@@ -1,0 +1,417 @@
+---
+layout: post
+title: "EventBus源码解析"
+date: 2018-08-02 21:36
+comments: false
+tags: 
+	- Android
+	- 源码
+---
+
+EventBus是Android很火的一个事件分发框架，能让Android开发中的消息事件得到了解偶。现在我们通过源码解读来探究下这个框架到底是怎么实现和进行工作的。
+
+EventBus项目地址：https://github.com/greenrobot/EventBus
+
+EventBus的源码不多，我们主要可以通过它的创建、订阅、发布消息、接触订阅这4个方面下手。
+<!-- more -->
+
+### EventBus的创建
+
+使用过EventBus的同学都知道，通过EventBus.getDefault()就可以得到一个EventBus的实例对象了，下面我们看下里面到底做了什么。
+
+```
+ /** Convenience singleton for apps using a process-wide EventBus instance. */
+    // 其实是通过单例的形式来创建了对象
+     public static EventBus getDefault() {
+         if (defaultInstance == null) {
+             synchronized (EventBus.class) {
+                 if (defaultInstance == null) {
+                     defaultInstance = new EventBus();
+                 }
+             }
+         }
+         return defaultInstance;
+     }
+```
+
+下面看看`new EventBus()`做了什么
+
+```
+    // EventBus的构造函数通过传入一个默认的EventBusBuilder来创建实例
+    // private static final EventBusBuilder DEFAULT_BUILDER = new EventBusBuilder();
+    public EventBus() {
+        this(DEFAULT_BUILDER);
+    }
+
+```
+```
+    // EventBus的构造函通过建造者模式来完成对象的初始化
+     EventBus(EventBusBuilder builder) {
+        logger = builder.getLogger(); // 获取默认的日志器
+        // 订阅方法存储 ：Map<Class<?>, CopyOnWriteArrayList<Subscription>> ，
+        // key是消息类的类型，value是一个线程安全的集合，存放该类型消息的订阅者
+        subscriptionsByEventType = new HashMap<>();
+        
+        // 注册的类型map ：Map<Object, List<Class<?>>>
+        // key 是注册的类 如 Activity，value是消息的类型
+        typesBySubscriber = new HashMap<>();
+        
+        // 粘性消息事件的map
+        // key是消息的类如event.getClass() ， value是event
+        stickyEvents = new ConcurrentHashMap<>();
+        // 里面封装了主线程的looper，支持线程的判断是否是主线程
+        mainThreadSupport = builder.getMainThreadSupport();
+        // 一个拥有主线长looper的Handler，用来分发事件消息的
+        mainThreadPoster = mainThreadSupport != null ? mainThreadSupport.createPoster(this) : null;
+        // 在后台发布消息的poster， 实现Runnable的接口，里面使用了synchronized
+        backgroundPoster = new BackgroundPoster(this);
+        // 在后台发布消息的poster， 实现Runnable的接口，
+        asyncPoster = new AsyncPoster(this);
+        
+        indexCount = builder.subscriberInfoIndexes != null ? builder.subscriberInfoIndexes.size() : 0;
+        // 订阅方法的解析者，负责通过订阅的类，把类中的订阅的方法给解析出来
+        subscriberMethodFinder = new SubscriberMethodFinder(builder.subscriberInfoIndexes,
+                builder.strictMethodVerification, builder.ignoreGeneratedIndex);
+                
+        logSubscriberExceptions = builder.logSubscriberExceptions;  // 是否打印异常
+        logNoSubscriberMessages = builder.logNoSubscriberMessages;  // 是否打印没有订阅的消息
+        sendSubscriberExceptionEvent = builder.sendSubscriberExceptionEvent; // 是否打印订阅者异常事件
+        sendNoSubscriberEvent = builder.sendNoSubscriberEvent;      // 是否发送没有订阅的事件
+        throwSubscriberException = builder.throwSubscriberException;   // 是否抛异常 
+        eventInheritance = builder.eventInheritance;            // 是否检测事件的父类与接口，符合条件的也会触发消息发送
+        //  线程池
+        executorService = builder.executorService;          
+    }
+```
+
+以上基本把EventBus的初始化都看完了，下面我们可以做个总结：
+
+1、EventBus可以通过EventBus.getDefault()初始化实例，该方法得到的是一个单例
+
+2、EventBus的创建是通过建造者模式创建的，创建是，会有很多的配置进行初始化
+
+3、EventBus可以自定义配置，`EventBus.builder().build();`的形式来完成自定义配置创建
+
+4、不同的EventBus的实例内的订阅是不互通的
+
+### EventBus的订阅者注册
+
+一般我们会在一个Activity中写订阅函数，并在onStart()方法中注册订阅者`EventBus.getDefault().register(this);
+
+```
+    // 订阅函数如下
+    // 可以配置线程模式，是否是粘性消息，和消息的权重
+    @Subscribe(threadMode = ThreadMode.MAIN, sticky = true, priority = 100)
+    public void subescribeMsg(MessageEvent event) {
+        Log.i("MainActivity", "get msg = " + event.msg);
+    }
+
+```
+
+下面我们通过`EventBus.getDefault().register(this);`这个方法的入口，看看里面到底怎么完成注册的
+
+```
+    public void register(Object subscriber) {
+        // 该方法主要做两件事 
+        Class<?> subscriberClass = subscriber.getClass();
+        // 1、获取所有的订阅方法
+        List<SubscriberMethod> subscriberMethods = subscriberMethodFinder.findSubscriberMethods(subscriberClass);
+        synchronized (this) {
+            // 2、将所有的订阅方法保存
+            for (SubscriberMethod subscriberMethod : subscriberMethods) {
+                subscribe(subscriber, subscriberMethod);
+            }
+        }
+    }
+```
+
+#### 获取所有订阅方法
+
+我们发现，EventBus获取订阅方法的任务是交给SubscriberMethodFinder这个类完成，通过分析subscriberMethodFinder.findSubscriberMethods(subscriberClass)看看他是怎么获取订阅函数的
+
+```
+    List<SubscriberMethod> findSubscriberMethods(Class<?> subscriberClass) {
+        // 1、 先通过METHOD_CACHE缓存获取
+        List<SubscriberMethod> subscriberMethods = METHOD_CACHE.get(subscriberClass);
+        if (subscriberMethods != null) {
+            return subscriberMethods;
+        }
+
+        if (ignoreGeneratedIndex) {
+        // 2、 通过反射
+            subscriberMethods = findUsingReflection(subscriberClass);
+        } else {
+        // 3、 通过事先生成好的订阅消息类（该类是通过注解处理器在编译期生成的）后面会另外讨论这个
+            subscriberMethods = findUsingInfo(subscriberClass);
+        }
+        if (subscriberMethods.isEmpty()) {
+            throw new EventBusException("Subscriber " + subscriberClass
+                    + " and its super classes have no public methods with the @Subscribe annotation");
+        } else {
+            METHOD_CACHE.put(subscriberClass, subscriberMethods);
+            return subscriberMethods;
+        }
+    }
+```
+
+1、SubscriberMethodFinder先从缓存中获取该类的所有订阅方法
+
+2、如果反射没有，可以通过反射的形式获取
+
+3、也可以从预先建好的subscriberInfoIndexes中获取，这种方式是可以避免反射带来的性能消耗。如果没有找到，还是会通过反射获取
+
+4、最后会将找到的订阅函数缓存，key是订阅类类型，value是List<SubscriberMethod>订阅方法的集合
+
+#### 将所有订阅方法注册到Map中
+
+我们查看EventBus的subscribe(Object subscriber, SubscriberMethod subscriberMethod)
+
+```
+    // 当得到订阅者中所有的订阅方法后，通过遍历，将订阅方法方法一个一个注册
+      // Must be called in synchronized block
+    private void subscribe(Object subscriber, SubscriberMethod subscriberMethod) {
+        Class<?> eventType = subscriberMethod.eventType;
+        // Subscription中封装了订阅者与一个订阅函数
+        Subscription newSubscription = new Subscription(subscriber, subscriberMethod);
+        CopyOnWriteArrayList<Subscription> subscriptions = subscriptionsByEventType.get(eventType);
+        if (subscriptions == null) {
+            subscriptions = new CopyOnWriteArrayList<>();
+            // 在subscriptionsByEventType 的map中，保存key是消息事件类类型，value是Subscription的集合
+            subscriptionsByEventType.put(eventType, subscriptions);
+        } else {
+            if (subscriptions.contains(newSubscription)) {
+                throw new EventBusException("Subscriber " + subscriber.getClass() + " already registered to event "
+                        + eventType);
+            }
+        }
+
+        int size = subscriptions.size();
+        for (int i = 0; i <= size; i++) {
+            if (i == size || subscriberMethod.priority > subscriptions.get(i).subscriberMethod.priority) {
+            // 根据订阅函数的优先级来保存在Subscription的集合中
+                subscriptions.add(i, newSubscription);
+                break;
+            }
+        }
+        // 在typesBySubscriber map中保存， key是订阅者，value是订阅消息类类型
+        List<Class<?>> subscribedEvents = typesBySubscriber.get(subscriber);
+        if (subscribedEvents == null) {
+            subscribedEvents = new ArrayList<>();
+            typesBySubscriber.put(subscriber, subscribedEvents);
+        }
+        subscribedEvents.add(eventType);
+
+        if (subscriberMethod.sticky) {
+            // 如果是粘性的订阅函数，从粘性消息事件中获取消息直接发送
+            if (eventInheritance) {
+                // Existing sticky events of all subclasses of eventType have to be considered.
+                // Note: Iterating over all events may be inefficient with lots of sticky events,
+                // thus data structure should be changed to allow a more efficient lookup
+                // (e.g. an additional map storing sub classes of super classes: Class -> List<Class>).
+                Set<Map.Entry<Class<?>, Object>> entries = stickyEvents.entrySet();
+                for (Map.Entry<Class<?>, Object> entry : entries) {
+                    Class<?> candidateEventType = entry.getKey();
+                    if (eventType.isAssignableFrom(candidateEventType)) {
+                        Object stickyEvent = entry.getValue();
+                        checkPostStickyEventToSubscription(newSubscription, stickyEvent);
+                    }
+                }
+            } else {
+                Object stickyEvent = stickyEvents.get(eventType);
+                checkPostStickyEventToSubscription(newSubscription, stickyEvent);
+            }
+        }
+    }
+
+```
+
+1、保存在subscriptionsByEventType的map中，key是消息事件类型（订阅者接收参数的类型），value是Subscription的有序集合（更具订阅函数的优先级排序），Subscription中封装了订阅者（Activity）和订阅函数
+
+2、保存在subscribedEvents的map中，key是订阅者对象，value是订阅的消息类型集合
+
+3、如果是粘性的订阅函数，会先触发粘性的消息发送
+
+### EventBus的消息发布
+
+EventBus有两种发布消息的方法1、EventBus.getDefault().post(""); 2、EventBus.getDefault().postSticky("");
+
+#### post()
+
+```
+    /** Posts the given event to the event bus. */
+    public void post(Object event) {
+        //PostingThreadState 是ThreadLocal实例，通过get得到一个PostingThreadState对象，该对象中有一个事件队列
+        // 这样做，可以保证一个线程只会得到一个PostingThreadState对象
+        PostingThreadState postingState = currentPostingThreadState.get();
+        // 将事件存入该线程的消息队列
+        List<Object> eventQueue = postingState.eventQueue;
+        eventQueue.add(event);
+
+        if (!postingState.isPosting) {
+            // 是否是主线程
+            postingState.isMainThread = isMainThread();
+            postingState.isPosting = true;
+            if (postingState.canceled) {
+                throw new EventBusException("Internal error. Abort state was not reset");
+            }
+            try {
+                while (!eventQueue.isEmpty()) {
+                //分发消息
+                    postSingleEvent(eventQueue.remove(0), postingState);
+                }
+            } finally {
+                postingState.isPosting = false;
+                postingState.isMainThread = false;
+            }
+        }
+    }
+```
+
+分发消息函数 postSingleEvent
+
+```
+    private void postSingleEvent(Object event, PostingThreadState postingState) throws Error {
+    
+        // 获取事件的类型
+        Class<?> eventClass = event.getClass();
+        boolean subscriptionFound = false;
+        
+        // 查找并分发消息
+        postSingleEventForEventType(event, postingState, eventClass);
+        // 。。。。。。
+   }
+```
+
+```
+    private boolean postSingleEventForEventType(Object event, PostingThreadState postingState, Class<?> eventClass) {
+        CopyOnWriteArrayList<Subscription> subscriptions;
+        synchronized (this) {
+            // 通过subscriptionsByEventType的map获取所有注册的订阅
+            subscriptions = subscriptionsByEventType.get(eventClass);
+        }
+        if (subscriptions != null && !subscriptions.isEmpty()) {
+            for (Subscription subscription : subscriptions) {
+            // 略。。。。。。
+            // 分发消息
+                postToSubscription(subscription, event, postingState.isMainThread);
+            }
+            return true;
+        }
+        return false;
+    }
+
+```
+
+最后分发消息
+
+```
+   private void postToSubscription(Subscription subscription, Object event, boolean isMainThread) {
+        // 通过不同的订阅函数的线程模式去分发消息
+        switch (subscription.subscriberMethod.threadMode) {
+            case POSTING:
+                invokeSubscriber(subscription, event);
+                break;
+            case MAIN:
+                if (isMainThread) {
+                    invokeSubscriber(subscription, event);
+                } else {
+                    mainThreadPoster.enqueue(subscription, event);
+                }
+                break;
+            case MAIN_ORDERED:
+                if (mainThreadPoster != null) {
+                    mainThreadPoster.enqueue(subscription, event);
+                } else {
+                    // temporary: technically not correct as poster not decoupled from subscriber
+                    invokeSubscriber(subscription, event);
+                }
+                break;
+            case BACKGROUND:
+                if (isMainThread) {
+                    backgroundPoster.enqueue(subscription, event);
+                } else {
+                    invokeSubscriber(subscription, event);
+                }
+                break;
+            case ASYNC:
+                asyncPoster.enqueue(subscription, event);
+                break;
+            default:
+                throw new IllegalStateException("Unknown thread mode: " + subscription.subscriberMethod.threadMode);
+        }
+    }
+```
+
+1、从ThreadLocal中获取当前线程的PostingThreadState，里面有消息的队列，消息发布状态等信息
+
+2、将消息保存队列中，并通过遍历队列分发消息
+
+3、通过消息类型从subscriptionsByEventType的map获取所有注册的订阅，遍历发送
+
+4、发送时会根据不同的订阅线程模式去选择线程发消息
+
+#### postSticky()
+
+```
+    // 将粘性消息保存在stickyEvents map中，并调用post()
+    public void postSticky(Object event) {
+        synchronized (stickyEvents) {
+            stickyEvents.put(event.getClass(), event);
+        }
+        // Should be posted after it is putted, in case the subscriber wants to remove immediately
+        post(event);
+    }
+
+```
+
+### EventBus解除注册
+
+下面我们看看最后的解除注册unregister()
+
+```
+    /** Unregisters the given subscriber from all event classes. */
+    public synchronized void unregister(Object subscriber) {
+        // 通过typesBySubscriber获取订阅者所订阅的类型，typesBySubscriber我们终于找到了使用的地方了
+        List<Class<?>> subscribedTypes = typesBySubscriber.get(subscriber);
+        if (subscribedTypes != null) {
+            for (Class<?> eventType : subscribedTypes) {
+            // 遍历所有类型，并调研unsubscribeByEventType
+                unsubscribeByEventType(subscriber, eventType);
+            }
+            // 从typesBySubscriber中移除
+            typesBySubscriber.remove(subscriber);
+        } else {
+            logger.log(Level.WARNING, "Subscriber to unregister was not registered before: " + subscriber.getClass());
+        }
+    }
+
+```
+
+```
+    /** Only updates subscriptionsByEventType, not typesBySubscriber! Caller must update typesBySubscriber. */
+    private void unsubscribeByEventType(Object subscriber, Class<?> eventType) {
+        // 通过类型找到所有的subscriptions，如果subscriptions里的subscriber是该需要解除组册的，就将该subscription从数组中移除
+        List<Subscription> subscriptions = subscriptionsByEventType.get(eventType);
+        if (subscriptions != null) {
+            int size = subscriptions.size();
+            for (int i = 0; i < size; i++) {
+                Subscription subscription = subscriptions.get(i);
+                if (subscription.subscriber == subscriber) {
+                    subscription.active = false;
+                    subscriptions.remove(i);
+                    i--;
+                    size--;
+                }
+            }
+        }
+    }
+    
+```
+
+1、通过订阅者从typesBySubscriber中获取所有消息类型
+   
+2、通过消息类型再从subscriptionsByEventType中移除对应的订阅信息
+   
+3、最后从typesBySubscriber中移除订阅者
+   
+   

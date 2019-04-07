@@ -1,0 +1,221 @@
+---
+layout: post
+title: "Android的So文件加载路径动态修改方案"
+date: 2017-08-22 10:36
+comments: false
+tags: 
+	- Android
+---
+
+​	我们都知道，Android开发中，加载so文件使用的方法是**System.loadLibrary()**,Android会自动的帮助我们去加载app的so文件。
+
+<!-- more -->
+
+​	apk安装后的so文件释放路径为：
+系统app：/system/lib64/ | /system/lib/
+第三方app：/data/app-lib/XXX/
+​	Android会去这些默认的路径中加载so文件。但是如果我们有的so文件没在这些路径下，或者需要动态去别地路径加载so文件，那该怎么办呢？
+
+## 修改默认的路径
+
+​	通过阅读System.loadLibrary方法源码：
+
+```
+// System 类的loadLibrary发现是调用Runtime.getRuntime().loadLibrary()方法
+public static void loadLibrary(String libname) {
+	Runtime.getRuntime().loadLibrary(VMStack.getCallingClassLoader(), libname);
+}
+```
+
+​	继续跟进Runtime
+
+```
+void loadLibrary(String libraryName, ClassLoader loader) {
+     // 重点是查看路径是怎么得到的
+    if (loader != null) {
+        //loader 不是空 主要是下面这个函数得到
+        String filename = loader.findLibrary(libraryName);
+        // 。。。。 略
+        return;
+    }
+	//loader 是空 主要是下面这个函数得到
+    String filename = System.mapLibraryName(libraryName);
+    // 。。。。 略
+}
+```
+
+一、跟进ClassLoader.findLibrary，其实是子类BaseDexClassLoader.findLibrary
+
+```
+@Override
+public String findLibrary(String name) {
+    return pathList.findLibrary(name);
+}
+```
+
+跟进DexPathList.findLibrary
+
+```
+public String findLibrary(String libraryName) {
+    // 这里与一开始的分支一样的方法
+    String fileName = System.mapLibraryName(libraryName);
+    // 从nativeLibraryDirectories中获取路径
+    for (File directory : nativeLibraryDirectories) {
+        String path = new File(directory, fileName).getPath();
+        if (IoUtils.canOpenReadOnly(path)) {
+            return path;
+        }
+    }
+    return null;
+}
+```
+
+分析到这里，我们来终结下
+
+其实System.loadLibrary方法调用Runtime.getRuntime().loadLibrary()，再通过BaseDexClassLoader.findLibrary去获取so的路径，而路径就存在BaseDexClassLoader.pathList 对象的nativeLibraryDirectories中，所以我们只要通过反射动态的在nativeLibraryDirectories添加我们要指定的路径，System.loadLibrary就能加载指定文件夹下的so文件了
+
+二、跟进System.mapLibraryName
+
+```
+  /**
+ * Returns the platform specific file name format for the shared library
+ * named by the argument. On Android, this would turn {@code "MyLibrary"} into
+ * {@code "libMyLibrary.so"}.
+ */
+//这个方法调用的是native函数，其实就是将名字进行修改，如MyLibrary变成libMyLibrary.so
+public static native String mapLibraryName(String nickname);
+```
+
+
+
+## 修改反射方法实践
+
+既然已经找到了目标，我们就要进行实践了，下面是我的一个反射修改的方法，适配了android的一些版本
+
+```java
+public class MySoFiles {
+
+    public void initNativeDirectory(Context context) {
+        if (hasDexClassLoader()) { // 4.0以上系统
+            try {
+                SLog.d(TAG, "AboveEqualApiLevel14");
+                createNewNativeDirAboveEqualApiLevel14(context);
+            } catch (Exception e) {
+                try {
+                    createNewNativeDirAboveEqualApiLevel21(context);
+                } catch (Exception e1) {
+                    SLog.e(TAG, e1);
+                }
+            }
+        } else {
+            try {
+                SLog.d(TAG, "BelowApiLevel14");
+                createNewNativeDirBelowApiLevel14(context); // 4.0以下系统
+            } catch (Exception e) {
+                SLog.e(TAG, e);
+            }
+        }
+    }
+
+    private void createNewNativeDirAboveEqualApiLevel21(Context context)
+            throws IllegalAccessException, NoSuchFieldException, ClassNotFoundException {
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.LOLLIPOP) {
+            PathClassLoader pathClassLoader = (PathClassLoader) context.getClassLoader();
+            Object pathList = getPathList(pathClassLoader);
+            SLog.d(TAG, "maybe is android 6.0");
+            Class<?> elementClass = Class.forName("dalvik.system.DexPathList$Element");
+            Constructor<?> element = null;
+            try {
+                element = elementClass.getConstructor(File.class, boolean.class, File.class, DexFile.class);
+            } catch (NoSuchMethodException e) {
+                SLog.e(TAG, e);
+            }
+            Object systemNativeLibraryDirectories = pathList.getClass()
+                    .getDeclaredField("systemNativeLibraryDirectories");
+            Object nativeLibraryDirectories = pathList.getClass().getDeclaredField("nativeLibraryDirectories");
+            Object nativeLibraryPathElements = pathList.getClass().getDeclaredField("nativeLibraryPathElements");
+            ((Field) systemNativeLibraryDirectories).setAccessible(true);
+            ((Field) nativeLibraryDirectories).setAccessible(true);
+            ((Field) nativeLibraryPathElements).setAccessible(true);
+            // 获取 DEXPATHList中的属性值
+            List<File> systemFiles = (List<File>) ((Field) systemNativeLibraryDirectories).get(pathList);
+            List<File> nativeFiles = (List<File>) ((Field) nativeLibraryDirectories).get(pathList);
+            Object[] elementFiles = (Object[]) ((Field) nativeLibraryPathElements).get(pathList);
+            Object newElementFiles = Array.newInstance(elementClass, elementFiles.length + 1);
+            systemFiles.add(context.getDir("libs", Context.MODE_PRIVATE));
+            nativeFiles.add(context.getDir("libs", Context.MODE_PRIVATE));
+            ((Field) systemNativeLibraryDirectories).set(pathList, systemFiles);
+            ((Field) nativeLibraryDirectories).set(pathList, nativeFiles);
+            if (element != null) {
+                try {
+                    Object newInstance = element.newInstance(
+                            new File(context.getDir("libs", Context.MODE_PRIVATE).getAbsolutePath()), true, null, null);
+                    Array.set(newElementFiles, 0, newInstance);
+                    for (int i = 1; i < elementFiles.length + 1; i++) {
+                        Array.set(newElementFiles, i, elementFiles[i - 1]);
+                    }
+                    ((Field) nativeLibraryPathElements).set(pathList, newElementFiles);
+                } catch (InstantiationException e) {
+                    SLog.e(TAG, e);
+                } catch (InvocationTargetException e) {
+                    SLog.e(TAG, e);
+                }
+            }
+        }
+    }
+
+    private void createNewNativeDirBelowApiLevel14(Context context)
+            throws NoSuchFieldException, IllegalAccessException {
+        PathClassLoader pathClassLoader = (PathClassLoader) context.getClassLoader();
+        Field mLibPaths = pathClassLoader.getClass().getDeclaredField("mLibPaths");
+        mLibPaths.setAccessible(true);
+        String[] libs = (String[]) (mLibPaths).get(pathClassLoader);
+        Object newPaths = Array.newInstance(String.class, libs.length + 1);
+        // 添加自定义.so路径
+        Array.set(newPaths, 0, context.getDir("libs", Context.MODE_PRIVATE).getAbsolutePath());
+        // 将系统自己的追加上
+        for (int i = 1; i < libs.length + 1; i++) {
+            Array.set(newPaths, i, libs[i - 1]);
+        }
+        mLibPaths.set(pathClassLoader, newPaths);
+    }
+
+    private void createNewNativeDirAboveEqualApiLevel14(Context context) throws Exception {
+        PathClassLoader pathClassLoader = (PathClassLoader) context.getClassLoader();
+        Object pathList = getPathList(pathClassLoader);
+        // 获取当前类的属性
+        Object nativeLibraryDirectories = pathList.getClass().getDeclaredField("nativeLibraryDirectories");
+        ((Field) nativeLibraryDirectories).setAccessible(true);
+        // 获取 DEXPATHList中的属性值
+        File[] files = (File[]) ((Field) nativeLibraryDirectories).get(pathList);
+        Object newfiles = Array.newInstance(File.class, files.length + 1);
+        // 添加自定义.so路径
+        Array.set(newfiles, 0, context.getDir("libs", Context.MODE_PRIVATE));
+        // 将系统自己的追加上
+        for (int i = 1; i < files.length + 1; i++) {
+            Array.set(newfiles, i, files[i - 1]);
+        }
+        ((Field) nativeLibraryDirectories).set(pathList, newfiles);
+    }
+
+    private Object getPathList(Object obj) throws ClassNotFoundException, NoSuchFieldException, IllegalAccessException {
+        return getField(obj, Class.forName("dalvik.system.BaseDexClassLoader"), "pathList");
+    }
+
+    private Object getField(Object obj, Class cls, String str) throws NoSuchFieldException, IllegalAccessException {
+        Field declaredField = cls.getDeclaredField(str);
+        declaredField.setAccessible(true);
+        return declaredField.get(obj);
+    }
+
+    private boolean hasDexClassLoader() {
+        try {
+            Class.forName("dalvik.system.BaseDexClassLoader");
+            return true;
+        } catch (ClassNotFoundException var1) {
+            return false;
+        }
+    }
+}
+```
+
